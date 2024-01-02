@@ -4,11 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sync"
 	"time"
-
-	"github.com/gdamore/tcell/v2"
-	"github.com/rivo/tview"
 )
 
 const (
@@ -16,15 +12,18 @@ const (
 	heartbeatInterval = 5 * time.Second
 )
 
-var heartbeats = make(map[string]int)
-var mutex = &sync.Mutex{}
-var table = tview.NewTable()
-var updateChan = make(chan peerStatus)
-
-type peerStatus struct {
+type PeerStatus struct {
 	peer   string
-	status string
+	action Action
 }
+
+type Action int
+
+const (
+	CONNECT Action = iota
+	DISCONNECT
+	HEARTBEAT
+)
 
 func main() {
 	peers := os.Args[1:]
@@ -35,95 +34,78 @@ func main() {
 		go sendHeartbeat(ip)
 	}
 
-	app := tview.NewApplication()
-	table.SetBorder(true).SetTitle("Connections").SetTitleColor(tcell.ColorGreen)
-	go func() {
-		if err := app.SetRoot(table, true).Run(); err != nil {
-			panic(err)
-		}
-	}()
-
-	go func() {
-		for ps := range updateChan {
-			updateTable(ps.peer, ps.status)
-		}
-	}()
-
 	select {}
 }
 
 func startServer() {
-	ln, err := net.Listen("tcp", port)
+	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	defer ln.Close()
+	defer listener.Close()
 
-	//fmt.Println("Server is running on port", port)
+	var updates = make(chan PeerStatus)
+	go updateTerminalUI(updates)
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			//fmt.Println(err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConnection(conn, updates)
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func updateTerminalUI(updates <-chan PeerStatus) {
+	for update := range updates {
+		switch update.action {
+		case CONNECT:
+			fmt.Printf("%s connected\n", update.peer)
+		case DISCONNECT:
+			fmt.Printf("%s disconnected\n", update.peer)
+		case HEARTBEAT:
+			fmt.Printf("%s heartbeat\n", update.peer)
+		}
+	}
+}
+
+func handleConnection(conn net.Conn, updates chan<- PeerStatus) {
 	defer conn.Close()
+
+	updates <- PeerStatus{conn.RemoteAddr().String(), CONNECT}
 
 	buffer := make([]byte, 1024)
 	peer := conn.RemoteAddr().String()
 	for {
 		_, err := conn.Read(buffer)
 		if err != nil {
-			fmt.Println(err)
-			mutex.Lock()
-			heartbeats[peer] = 0
-			mutex.Unlock()
-			updateChan <- peerStatus{peer, "(disconnected)"}
+			updates <- PeerStatus{peer, DISCONNECT}
 			return
 		}
-		//fmt.Println("Received:", string(buffer[:n]))
-		mutex.Lock()
-		heartbeats[peer]++
-		mutex.Unlock()
-		updateChan <- peerStatus{peer, fmt.Sprintf("%d", heartbeats[peer])}
+		updates <- PeerStatus{peer, HEARTBEAT}
 	}
 }
 
 func sendHeartbeat(ip string) {
 	for {
-		//fmt.Printf("Attempting to connect to %s\n", ip)
+		fmt.Printf("Sending heartbeat to %s\n", ip)
 		conn, err := net.Dial("tcp", ip+port)
 		if err != nil {
-			//fmt.Println(err)
+			fmt.Printf("Could not connect to %s\n", ip)
 			time.Sleep(heartbeatInterval)
 			continue
 		}
 		defer conn.Close()
 
 		for {
+			fmt.Printf("Sending heartbeat to %s\n", ip)
 			_, err := conn.Write([]byte("Ping"))
 			if err != nil {
-				//fmt.Println(err)
+				fmt.Printf("Could not send heartbeat to %s\n", ip)
 				break
 			}
 			time.Sleep(heartbeatInterval)
 		}
 	}
-}
-
-func updateTable(peer, status string) {
-	for row := 0; row < table.GetRowCount(); row++ {
-		if cell := table.GetCell(row, 0); cell.Text == peer {
-			table.SetCellSimple(row, 1, status)
-			return
-		}
-	}
-	table.SetCellSimple(table.GetRowCount(), 0, peer)
-	table.SetCellSimple(table.GetRowCount()-1, 1, status)
 }
